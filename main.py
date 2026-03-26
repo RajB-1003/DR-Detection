@@ -244,3 +244,121 @@ async def analyze_fundus(file: UploadFile = File(...)):
     except Exception as e:
         print(f"Error during inference: {e}")
         raise HTTPException(status_code=500, detail="Internal ML processing error.")
+
+class BloodDetectionResponse(BaseModel):
+    status: str
+    dr_stage: str
+    blood_spots_count: int
+    annotated_image_base64: str
+    local_suggestion_en: str
+    local_suggestion_native: str
+
+def detect_blood_and_classify(image_array):
+    # 1. Extract Green Channel (blood absorbs green light)
+    green_channel = image_array[:, :, 1]
+    
+    # 2. Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced_green = clahe.apply(green_channel)
+    
+    # 3. Apply Morphological Bottom-Hat Transform to highlight dark lesions/blood
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    bottom_hat = cv2.morphologyEx(enhanced_green, cv2.MORPH_BLACKHAT, kernel)
+    
+    # 4. Threshold to binarize and extract exact blood spots
+    _, thresh = cv2.threshold(bottom_hat, 25, 255, cv2.THRESH_BINARY)
+    
+    # 5. Clean noise with Morphological Opening
+    noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, noise_kernel)
+    
+    # 6. Find contours of the blood spots
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Count strict valid spots and draw them
+    valid_spots = 0
+    annotated_image = image_array.copy()
+    
+    for c in contours:
+        area = cv2.contourArea(c)
+        if 5 < area < 200:  # Adjust area threshold appropriately for lesions
+            valid_spots += 1
+            # Draw a distinct green contour around the blood spot for visibility
+            cv2.drawContours(annotated_image, [c], -1, (0, 255, 0), 2)
+            
+    # Heuristic Classification into 4 Stages based on blood spot count
+    if valid_spots <= 3:
+        stage = "Mild"
+        sugg_en = "Minimal blood detected. Schedule annual checkup."
+        sugg_native = "குறைந்தபட்ச இரத்தம் கண்டறியப்பட்டது. ஆண்டுதோறும் பரிசோதனை செய்யவும்."
+    elif valid_spots <= 10:
+        stage = "Moderate"
+        sugg_en = "Moderate hemorrhages detected. Schedule a follow-up in 3-6 months."
+        sugg_native = "மிதமான இரத்தக்கசிவு உள்ளது. 3-6 மாதங்களில் பரிசோதிக்கவும்."
+    elif valid_spots <= 25:
+        stage = "Severe"
+        sugg_en = "Severe hemorrhages detected. Immediate referral to an ophthalmologist."
+        sugg_native = "கடுமையான இரத்தக்கசிவு. உடனடியாக மருத்துவரை அணுகவும்."
+    else:
+        stage = "Advanced"
+        sugg_en = "Advanced/Proliferative DR. Very high risk of vision loss. Urgent surgery or treatment needed."
+        sugg_native = "முற்றிய நிலை. பார்வை இழக்கும் அபாயம் அதிகம். அவசர சிகிச்சை தேவை."
+        
+    _, buffer = cv2.imencode('.png', annotated_image)
+    b64 = base64.b64encode(buffer).decode('utf-8')
+    
+    return stage, valid_spots, sugg_en, sugg_native, f"data:image/png;base64,{b64}"
+
+@app.post("/api/v1/detect_blood", response_model=BloodDetectionResponse)
+async def analyze_blood(file: UploadFile = File(...)):
+    """
+    OpenCV based API to isolate and highlight blood hemorrhages directly, 
+    independent of the AI model.
+    """
+    if file.content_type not in ["image/jpeg", "image/png"]:
+        raise HTTPException(status_code=400, detail="Invalid format.")
+
+    image_bytes = await file.read()
+    
+    if MOCK_MODE:
+        dummy_heatmap = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        return BloodDetectionResponse(
+            status="success",
+            dr_stage="Severe",
+            blood_spots_count=18,
+            annotated_image_base64=f"data:image/png;base64,{dummy_heatmap}",
+            local_suggestion_en="Severe hemorrhages detected. Immediate referral to an ophthalmologist.",
+            local_suggestion_native="கடுமையான இரத்தக்கசிவு. உடனடியாக மருத்துவரை அணுகவும்."
+        )
+
+    try:
+        # Load raw image
+        image_pil = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        raw_img_array = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+        
+        # Crop the black borders exactly like preprocess_images
+        gray = cv2.cvtColor(raw_img_array, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(c)
+            raw_img_array = raw_img_array[y:y+h, x:x+w]
+            
+        clean_display_img = cv2.resize(raw_img_array, (400, 400)) 
+        
+        stage, spots, sugg_en, sugg_native, b64 = detect_blood_and_classify(clean_display_img)
+        
+        return BloodDetectionResponse(
+            status="success",
+            dr_stage=stage,
+            blood_spots_count=spots,
+            annotated_image_base64=b64,
+            local_suggestion_en=sugg_en,
+            local_suggestion_native=sugg_native
+        )
+
+    except Exception as e:
+        print(f"Error during OpenCV classification: {e}")
+        raise HTTPException(status_code=500, detail="Internal ML processing error.")

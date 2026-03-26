@@ -131,6 +131,13 @@ def generate_gradcam(image_tensor, original_img_array):
     # Forward pass
     output = model(image_tensor)
     
+    # --- BOOST DR SENSITIVITY ---
+    # The dataset was highly imbalanced, causing mostly "No DR" predictions.
+    # We penalize "No DR" (Class 0) by -2.0 and slightly boost the DR classes to force sensitivity.
+    # You can tweak these values to make the model more or less sensitive.
+    sensitivity = torch.tensor([-2.0, 0.5, 0.5, 0.5, 0.5]).to(device)
+    output = output + sensitivity
+    
     # Get the prediction
     pred_class = output.argmax(dim=1).item()
     confidence = F.softmax(output, dim=1)[0][pred_class].item() * 100

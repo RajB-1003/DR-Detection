@@ -37,7 +37,14 @@ class ResNet50Inference:
         
         # Load custom fine-tuned weights if provided
         if model_weights_path and os.path.exists(model_weights_path):
-            self.model.load_state_dict(torch.load(model_weights_path, map_location=self.device))
+            state_dict = torch.load(model_weights_path, map_location=self.device)
+            # Remove 'module.' prefix if the model was trained with DataParallel
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            self.model.load_state_dict(new_state_dict, strict=False)
             
         # Move model to device and set to evaluation mode
         self.model = self.model.to(self.device)
@@ -81,13 +88,48 @@ class ResNet50Inference:
             }
             
         try:
+            import cv2
+            import numpy as np
+            
+            # Convert PIL image to BGR openCV format
+            raw_img_array = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            
+            # --- BEGIN PREPROCESSING FROM MAIN.PY ---
+            sigmaX = 10
+            img_copy = raw_img_array.copy()
+            
+            # Crop the black borders to isolate the circular retina
+            gray = cv2.cvtColor(img_copy, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                c = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(c)
+                img_copy = img_copy[y:y+h, x:x+w]
+                
+            clean_display_img = cv2.resize(img_copy, (224, 224))
+            rgb_image = cv2.cvtColor(clean_display_img, cv2.COLOR_BGR2RGB)
+            blurred = cv2.GaussianBlur(rgb_image, (0, 0), sigmaX)
+            model_input_img = cv2.addWeighted(rgb_image, 4, blurred, -4, 128)
+            # --- END PREPROCESSING ---
+            
+            processed_pil = Image.fromarray(model_input_img)
+            
             # Apply preprocessing and add batch dimension -> [1, 3, 224, 224]
-            input_tensor = self.transform(image).unsqueeze(0)
+            input_tensor = self.transform(processed_pil).unsqueeze(0)
             input_tensor = input_tensor.to(self.device)
             
             # Disable gradient calculation for faster memory-efficient inference
             with torch.no_grad():
                 output = self.model(input_tensor)
+                
+                # --- BOOST DR SENSITIVITY ---
+                # The dataset was highly imbalanced, causing mostly "No DR" predictions.
+                # We penalize "No DR" (Class 0) by -2.0 and slightly boost the DR classes to force sensitivity.
+                # You can tweak these values to make the model more or less sensitive.
+                sensitivity = torch.tensor([-2.0, 0.5, 0.5, 0.5, 0.5]).to(self.device)
+                output = output + sensitivity
                 
                 # Apply softmax to calculate probabilities
                 probabilities = torch.nn.functional.softmax(output[0], dim=0)
@@ -121,7 +163,10 @@ def get_classifier() -> ResNet50Inference:
     """
     global _CLASSIFIER_INSTANCE
     if _CLASSIFIER_INSTANCE is None:
-        _CLASSIFIER_INSTANCE = ResNet50Inference(num_classes=5)
+        _CLASSIFIER_INSTANCE = ResNet50Inference(
+            num_classes=5, 
+            model_weights_path='Resnet-50/resnet50_best_model.pth'
+        )
     return _CLASSIFIER_INSTANCE
 
 def predict_image(image_path: str) -> dict:
